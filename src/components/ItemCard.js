@@ -51,6 +51,10 @@ export function createItemCard({ item, zones, currentListId, labels, onMove, onR
     dataset: { itemId: item.id },
     attrs: { tabindex: "0", draggable: "true" },
   }, [
+    el("span", {
+      className: "item-drag-handle",
+      attrs: { title: labels.dragItem, "aria-hidden": "true" },
+    }, [icon("drag_indicator")]),
     el("div", { className: "item-thumb" }, [thumb]),
     el("div", { className: "item-copy" }, [
       el("strong", { text: item.title }),

@@ -6,12 +6,16 @@ import { enrichWikipediaItemImage } from "../services/wikipediaApi.js?v=images";
 import { createItemCard } from "./ItemCard.js?v=images";
 
 const imageLookupIds = new Set();
+const TOUCH_DRAG_EDGE = 72;
+const TOUCH_DRAG_MAX_SCROLL_STEP = 18;
 
 export function createBoard({ store, snackbar, onAddItems }) {
   const root = el("section", { className: "board-panel" });
   let exportElement = null;
+  let touchDrag = null;
 
   function render(state) {
+    cancelTouchDrag();
     const view = getActiveView(state);
     const presentation = getViewPresentation(view);
     const labels = {
@@ -19,6 +23,7 @@ export function createBoard({ store, snackbar, onAddItems }) {
       moveTo: t(state, "moveTo"),
       openArticle: t(state, "openArticle"),
       removeItem: t(state, "removeItem"),
+      dragItem: t(state, "dragItem"),
     };
 
     exportElement = el("section", {
@@ -35,6 +40,7 @@ export function createBoard({ store, snackbar, onAddItems }) {
     clear(root);
     root.append(exportElement, deck);
     wireNativeDrag();
+    wireTouchDrag();
     enrichVisibleItemImages(state);
   }
 
@@ -223,12 +229,14 @@ export function createBoard({ store, snackbar, onAddItems }) {
   function wireNativeDrag() {
     root.querySelectorAll(".item-card").forEach((card) => {
       card.addEventListener("dragstart", (event) => {
+        if (!event.dataTransfer) return;
         event.dataTransfer.effectAllowed = "move";
         event.dataTransfer.setData("text/plain", card.dataset.itemId);
         card.classList.add("item-card--drag");
       });
       card.addEventListener("dragend", () => {
         card.classList.remove("item-card--drag");
+        clearNativeDropTargets();
       });
     });
 
@@ -243,12 +251,219 @@ export function createBoard({ store, snackbar, onAddItems }) {
       });
       list.addEventListener("drop", (event) => {
         event.preventDefault();
-        list.classList.remove("item-list--drop-target");
+        clearNativeDropTargets();
         const itemId = event.dataTransfer.getData("text/plain");
         const targetListId = list.dataset.listId;
         if (!itemId || !targetListId) return;
         store.moveItem(itemId, targetListId, getDropIndex(list, event.clientX, event.clientY));
       });
+    });
+  }
+
+  function wireTouchDrag() {
+    root.querySelectorAll(".item-drag-handle").forEach((handle) => {
+      handle.addEventListener("pointerdown", startTouchDrag);
+    });
+  }
+
+  function startTouchDrag(event) {
+    if (event.pointerType === "mouse" || !event.isPrimary) return;
+
+    const card = event.currentTarget.closest(".item-card");
+    if (!card?.dataset.itemId) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    cancelTouchDrag();
+
+    const rect = card.getBoundingClientRect();
+    const ghost = card.cloneNode(true);
+    ghost.classList.remove("item-card--drag", "item-card--touch-source");
+    ghost.classList.add("item-card--touch-ghost");
+    ghost.setAttribute("aria-hidden", "true");
+    ghost.removeAttribute("tabindex");
+    ghost.removeAttribute("draggable");
+    ghost.style.width = `${rect.width}px`;
+    ghost.style.height = `${rect.height}px`;
+    document.body.append(ghost);
+
+    touchDrag = {
+      pointerId: event.pointerId,
+      itemId: card.dataset.itemId,
+      sourceCard: card,
+      ghost,
+      placeholder: el("div", { className: "item-drop-placeholder", attrs: { "aria-hidden": "true" } }),
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+      targetList: null,
+      targetIndex: 0,
+    };
+
+    card.classList.add("item-card--drag", "item-card--touch-source");
+    document.body.classList.add("is-touch-dragging");
+
+    try {
+      card.setPointerCapture(event.pointerId);
+    } catch {
+      // Some browsers do not allow capture after touch retargeting.
+    }
+
+    window.addEventListener("pointermove", handleTouchDragMove, { passive: false });
+    window.addEventListener("pointerup", handleTouchDragEnd, { passive: false });
+    window.addEventListener("pointercancel", cancelTouchDrag, { passive: false });
+    window.addEventListener("blur", cancelTouchDrag);
+
+    moveTouchGhost(event.clientX, event.clientY);
+    updateTouchDropTarget(event.clientX, event.clientY);
+  }
+
+  function handleTouchDragMove(event) {
+    if (!touchDrag || event.pointerId !== touchDrag.pointerId) return;
+
+    event.preventDefault();
+    moveTouchGhost(event.clientX, event.clientY);
+    autoScrollForTouchDrag(event.clientX, event.clientY);
+    updateTouchDropTarget(event.clientX, event.clientY);
+  }
+
+  function handleTouchDragEnd(event) {
+    if (!touchDrag || event.pointerId !== touchDrag.pointerId) return;
+
+    event.preventDefault();
+    updateTouchDropTarget(event.clientX, event.clientY);
+
+    const itemId = touchDrag.itemId;
+    const targetList = touchDrag.targetList;
+    const targetIndex = touchDrag.targetIndex;
+    cleanupTouchDrag();
+
+    if (targetList?.dataset.listId) {
+      store.moveItem(itemId, targetList.dataset.listId, targetIndex);
+    }
+  }
+
+  function cancelTouchDrag(event) {
+    if (!touchDrag) return;
+    if (event?.pointerId !== undefined && event.pointerId !== touchDrag.pointerId) return;
+    cleanupTouchDrag();
+  }
+
+  function cleanupTouchDrag() {
+    const drag = touchDrag;
+    touchDrag = null;
+
+    window.removeEventListener("pointermove", handleTouchDragMove);
+    window.removeEventListener("pointerup", handleTouchDragEnd);
+    window.removeEventListener("pointercancel", cancelTouchDrag);
+    window.removeEventListener("blur", cancelTouchDrag);
+
+    if (drag?.sourceCard?.isConnected) {
+      drag.sourceCard.classList.remove("item-card--drag", "item-card--touch-source");
+      try {
+        if (drag.sourceCard.hasPointerCapture?.(drag.pointerId)) {
+          drag.sourceCard.releasePointerCapture(drag.pointerId);
+        }
+      } catch {
+        // The pointer may already be released after pointerup/cancel.
+      }
+    }
+
+    drag?.ghost?.remove();
+    drag?.placeholder?.remove();
+    document.body.classList.remove("is-touch-dragging");
+    clearTouchDropTarget();
+  }
+
+  function moveTouchGhost(clientX, clientY) {
+    if (!touchDrag) return;
+    const x = Math.round(clientX - touchDrag.offsetX);
+    const y = Math.round(clientY - touchDrag.offsetY);
+    touchDrag.ghost.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+  }
+
+  function updateTouchDropTarget(clientX, clientY) {
+    if (!touchDrag) return;
+
+    const list = findSortableListAtPoint(clientX, clientY);
+    if (!list) {
+      setTouchDropTarget(null, 0);
+      return;
+    }
+
+    setTouchDropTarget(list, getDropIndex(list, clientX, clientY));
+  }
+
+  function setTouchDropTarget(list, index) {
+    if (!touchDrag) return;
+
+    if (touchDrag.targetList && touchDrag.targetList !== list) {
+      touchDrag.targetList.classList.remove("item-list--drop-target", "item-list--has-placeholder");
+    }
+
+    if (!list) {
+      touchDrag.placeholder.remove();
+      touchDrag.targetList = null;
+      touchDrag.targetIndex = 0;
+      return;
+    }
+
+    list.classList.add("item-list--drop-target", "item-list--has-placeholder");
+    const cards = [...list.querySelectorAll(".item-card:not(.item-card--drag)")];
+    const before = cards[index] || null;
+    if (before) list.insertBefore(touchDrag.placeholder, before);
+    else list.append(touchDrag.placeholder);
+
+    touchDrag.targetList = list;
+    touchDrag.targetIndex = index;
+  }
+
+  function findSortableListAtPoint(clientX, clientY) {
+    for (const node of document.elementsFromPoint(clientX, clientY)) {
+      if (!(node instanceof Element)) continue;
+      const list = node.closest(".js-sortable-list");
+      if (list && root.contains(list)) return list;
+    }
+    return null;
+  }
+
+  function autoScrollForTouchDrag(clientX, clientY) {
+    const verticalStep = getEdgeScrollStep(clientY, 0, window.innerHeight);
+    if (verticalStep) window.scrollBy(0, verticalStep);
+
+    if (root.scrollWidth <= root.clientWidth) return;
+    const rect = root.getBoundingClientRect();
+    const horizontalStep = getEdgeScrollStep(clientX, rect.left, rect.right);
+    if (horizontalStep) root.scrollLeft += horizontalStep;
+  }
+
+  function getEdgeScrollStep(point, start, end) {
+    const size = Math.max(1, end - start);
+    const edge = Math.min(TOUCH_DRAG_EDGE, size / 3);
+    const before = point - start;
+    const after = end - point;
+
+    if (before < edge) {
+      const progress = Math.min(1, (edge - before) / edge);
+      return -Math.ceil(progress * TOUCH_DRAG_MAX_SCROLL_STEP);
+    }
+
+    if (after < edge) {
+      const progress = Math.min(1, (edge - after) / edge);
+      return Math.ceil(progress * TOUCH_DRAG_MAX_SCROLL_STEP);
+    }
+
+    return 0;
+  }
+
+  function clearNativeDropTargets() {
+    root.querySelectorAll(".item-list--drop-target").forEach((list) => {
+      list.classList.remove("item-list--drop-target");
+    });
+  }
+
+  function clearTouchDropTarget() {
+    root.querySelectorAll(".item-list--drop-target, .item-list--has-placeholder").forEach((list) => {
+      list.classList.remove("item-list--drop-target", "item-list--has-placeholder");
     });
   }
 
